@@ -90,18 +90,28 @@ def _init_session_state() -> None:
 
 # ── Zone dict schema ─────────────────────────────────────────────────────────
 # {
-#   "id":          str          — uuid4
-#   "zone_type":   str          — "Isochrone" | "Distance Circle"
-#   "mode":        str          — "Car" | "Bicycle" | "Walking" | "Public Transit"
-#   "minutes":     int          — travel time (isochrone only)
-#   "radius_km":   float        — radius (distance circle only)
-#   "color":       str          — hex colour
-#   "lat":         float | None
-#   "lon":         float | None
-#   "search_text": str
-#   "geojson":     dict | None
-#   "error":       str | None
+#   "id":             str          — uuid4
+#   "zone_type":      str          — "Isochrone" | "Distance Circle"
+#   "mode":           str          — "Car" | "Bicycle" | "Walking" | "Public Transit"
+#   "minutes":        int          — ideal inner time limit (isochrone only)
+#   "radius_km":      float        — ideal inner radius (distance circle only)
+#   "color":          str          — hex colour
+#   "lat":            float | None
+#   "lon":            float | None
+#   "search_text":    str
+#   "geojson":        dict | None  — inner (ideal) boundary GeoJSON Feature
+#   "error":          str | None
+#   # Range (borderline outer zone) — optional
+#   "has_range":      bool         — whether to show an outer "acceptable" boundary
+#   "range_minutes":  int          — outer time limit (isochrone, > minutes)
+#   "range_km":       float        — outer radius (distance circle, > radius_km)
+#   "range_geojson":  dict | None  — outer boundary GeoJSON Feature
+#   "range_error":    str | None
 # }
+#
+# When has_range is True the rendered zone shows:
+#   inner boundary  — solid fill (ideal area)
+#   outer ring      — outer.difference(inner), dashed border + lighter fill (borderline)
 #
 # ── Step dict schema ─────────────────────────────────────────────────────────
 # {
@@ -206,9 +216,18 @@ def evaluate_operations(
     """
     zone_geoms: dict[str, object] = {}
     for i, z in enumerate(zones):
-        if z.get("geojson") and i < len(ZONE_LABELS):
+        if i >= len(ZONE_LABELS):
+            continue
+        # Prefer the outer boundary for operations when a range is defined,
+        # since that represents the full "acceptable" extent of the zone.
+        geojson_for_ops = (
+            z.get("range_geojson")
+            if z.get("has_range") and z.get("range_geojson")
+            else z.get("geojson")
+        )
+        if geojson_for_ops:
             try:
-                zone_geoms[ZONE_LABELS[i]] = _to_shapely(z["geojson"])
+                zone_geoms[ZONE_LABELS[i]] = _to_shapely(geojson_for_ops)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -315,24 +334,47 @@ def _compute_zone(zone: dict) -> None:
         return
     zone["geojson"] = None
     zone["error"] = None
+    zone["range_geojson"] = None
+    zone["range_error"] = None
 
     if zone["zone_type"] == "Isochrone":
         if not GEOAPIFY_KEY:
             zone["error"] = "GEOAPIFY_API_KEY not set."
             return
+        api_mode = TRANSPORT_MODES[zone["mode"]]
+        # Inner (ideal) boundary
         try:
-            feature = fetch_isochrone(lat, lon, TRANSPORT_MODES[zone["mode"]], zone["minutes"])
+            feature = fetch_isochrone(lat, lon, api_mode, zone["minutes"])
             if feature is None:
                 zone["error"] = "API returned no isochrone."
             else:
                 zone["geojson"] = feature
         except RuntimeError as exc:
             zone["error"] = f"API error: {exc}"
+        # Outer (acceptable) boundary
+        if zone.get("has_range") and zone["geojson"] is not None:
+            outer_min = zone.get("range_minutes", zone["minutes"] + 15)
+            try:
+                rf = fetch_isochrone(lat, lon, api_mode, outer_min)
+                if rf is None:
+                    zone["range_error"] = "API returned no outer isochrone."
+                else:
+                    zone["range_geojson"] = rf
+            except RuntimeError as exc:
+                zone["range_error"] = f"API error: {exc}"
     else:
+        # Inner circle
         try:
             zone["geojson"] = make_distance_circle(lat, lon, zone["radius_km"])
         except Exception as exc:  # noqa: BLE001
             zone["error"] = f"Circle error: {exc}"
+        # Outer circle
+        if zone.get("has_range") and zone["geojson"] is not None:
+            outer_km = zone.get("range_km", zone["radius_km"] * 1.5)
+            try:
+                zone["range_geojson"] = make_distance_circle(lat, lon, outer_km)
+            except Exception as exc:  # noqa: BLE001
+                zone["range_error"] = f"Circle error: {exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -344,12 +386,13 @@ def _bounds_from_zones(zones: list[dict]) -> list | None:
     for z in zones:
         if z.get("lat") and z.get("lon"):
             pts.append((z["lat"], z["lon"]))
-        if z.get("geojson"):
-            try:
-                b = _to_shapely(z["geojson"]).bounds
-                pts += [(b[1], b[0]), (b[3], b[2])]
-            except Exception:  # noqa: BLE001
-                pass
+        for gj_key in ("geojson", "range_geojson"):
+            if z.get(gj_key):
+                try:
+                    b = _to_shapely(z[gj_key]).bounds
+                    pts += [(b[1], b[0]), (b[3], b[2])]
+                except Exception:  # noqa: BLE001
+                    pass
     if not pts:
         return None
     min_lat = min(p[0] for p in pts)
@@ -387,12 +430,14 @@ def build_map(render_items: list[dict], bounds: list | None) -> folium.Map:
         if feature.get("type") != "Feature":
             feature = {"type": "Feature", "geometry": feature, "properties": {}}
 
+        dash_array = item.get("dash_array")
         folium.GeoJson(
             feature,
             tooltip=label,
-            style_function=lambda _f, c=color, fo=fill_opacity, w=weight, o=opacity: {
+            style_function=lambda _f, c=color, fo=fill_opacity, w=weight, o=opacity, da=dash_array: {
                 "fillColor": c, "color": c,
                 "weight": w, "fillOpacity": fo, "opacity": o,
+                **( {"dashArray": da} if da else {} ),
             },
         ).add_to(m)
 
@@ -414,38 +459,77 @@ def build_map(render_items: list[dict], bounds: list | None) -> folium.Map:
 # Render items builder
 # ---------------------------------------------------------------------------
 
-def _zone_render_item(z: dict, idx: int, **overrides) -> dict:
+def _zone_render_items(z: dict, idx: int, ghost: bool = False) -> list[dict]:
+    """
+    Return 1–2 render items for a zone.
+    If the zone has a computed range, emits:
+      • outer ring  (dashed, lighter fill) — rendered first (bottom layer)
+      • inner zone  (solid fill)           — rendered second (top layer)
+    Otherwise emits just the inner zone.
+    ghost=True reduces opacity for background display in Build-Operation mode.
+    """
+    if not z.get("geojson"):
+        return []
+
     label = f"Zone {ZONE_LABELS[idx]}" if idx < len(ZONE_LABELS) else f"Zone {idx}"
-    item: dict = {
-        "color": z["color"],
+    color = z["color"]
+    origin = (z["lat"], z["lon"]) if z.get("lat") and z.get("lon") else None
+
+    if ghost:
+        inner_style = {"fill_opacity": 0.06, "weight": 1.0, "opacity": 0.30}
+        ring_style  = {"fill_opacity": 0.03, "weight": 1.0, "opacity": 0.20}
+    else:
+        inner_style = {"fill_opacity": 0.28, "weight": 2,   "opacity": 0.85}
+        ring_style  = {"fill_opacity": 0.10, "weight": 2,   "opacity": 0.60, "dash_array": "7 5"}
+
+    items: list[dict] = []
+
+    # Outer ring — rendered before inner so inner sits on top
+    if z.get("has_range") and z.get("range_geojson"):
+        try:
+            inner_geom = _to_shapely(z["geojson"])
+            outer_geom = _to_shapely(z["range_geojson"])
+            ring_geom  = outer_geom.difference(inner_geom)
+            if not ring_geom.is_empty:
+                ring_item: dict = {
+                    "color": color,
+                    "feature": _to_geojson_feature(ring_geom),
+                    "label": f"{label} (borderline)",
+                    **ring_style,
+                }
+                if origin:
+                    ring_item["origin"] = origin
+                items.append(ring_item)
+        except Exception:  # noqa: BLE001
+            pass  # silently skip a bad ring rather than crashing
+
+    # Inner (ideal) zone
+    inner_item: dict = {
+        "color": color,
         "feature": z["geojson"],
-        "fill_opacity": 0.25,
-        "weight": 2,
-        "opacity": 0.8,
         "label": label,
+        **inner_style,
     }
-    if z.get("lat") and z.get("lon"):
-        item["origin"] = (z["lat"], z["lon"])
-    item.update(overrides)
-    return item
+    if origin:
+        inner_item["origin"] = origin
+    items.append(inner_item)
+
+    return items
 
 
 def _get_render_items() -> list[dict]:
     zones = st.session_state.zones
 
     if st.session_state.display_mode == "Show All":
-        return [
-            _zone_render_item(z, i)
-            for i, z in enumerate(zones)
-            if z.get("geojson")
-        ]
+        items: list[dict] = []
+        for i, z in enumerate(zones):
+            items.extend(_zone_render_items(z, i, ghost=False))
+        return items
 
     # ── Build Operation mode ──────────────────────────────────────────────
-    ghost_items = [
-        _zone_render_item(z, i, fill_opacity=0.06, weight=1.0, opacity=0.3)
-        for i, z in enumerate(zones)
-        if z.get("geojson")
-    ]
+    ghost_items: list[dict] = []
+    for i, z in enumerate(zones):
+        ghost_items.extend(_zone_render_items(z, i, ghost=True))
 
     steps = st.session_state.op_steps
     if not steps:
@@ -560,6 +644,52 @@ def _render_zone_editor(idx: int, zone: dict) -> None:
 
     zone["color"] = st.color_picker("Colour", zone["color"], key=f"color_{z_id}")
 
+    # ── Range (outer "acceptable" boundary) ──────────────────────────────
+    new_has_range = st.checkbox(
+        "Add outer 'acceptable' boundary",
+        value=zone.get("has_range", False),
+        key=f"has_range_{z_id}",
+        help="Show a second, larger zone with a dashed border — e.g. 'ideally 20 min, up to 30 if necessary'.",
+    )
+    if new_has_range != zone.get("has_range", False):
+        zone["has_range"] = new_has_range
+        zone["range_geojson"] = None
+        zone["range_error"] = None
+
+    if zone.get("has_range"):
+        if zone["zone_type"] == "Isochrone":
+            inner_min = zone["minutes"]
+            range_default = max(zone.get("range_minutes", inner_min + 15), inner_min + 5)
+            new_range_min = st.slider(
+                "Acceptable up to (minutes)",
+                min_value=inner_min + 5,
+                max_value=180,
+                value=range_default,
+                step=5,
+                key=f"range_min_{z_id}",
+            )
+            if new_range_min != zone.get("range_minutes"):
+                zone["range_minutes"] = new_range_min
+                zone["range_geojson"] = None
+                zone["range_error"] = None
+        else:
+            inner_km = zone["radius_km"]
+            range_default = max(zone.get("range_km", round(inner_km * 1.5, 1)), inner_km + 0.5)
+            new_range_km = st.number_input(
+                "Acceptable up to (km)",
+                min_value=inner_km + 0.1,
+                max_value=1000.0,
+                value=float(range_default),
+                step=0.5,
+                key=f"range_km_{z_id}",
+                format="%.1f",
+            )
+            if float(new_range_km) != zone.get("range_km"):
+                zone["range_km"] = float(new_range_km)
+                zone["range_geojson"] = None
+                zone["range_error"] = None
+
+    # ── Compute / Remove ──────────────────────────────────────────────────
     col1, col2 = st.columns(2)
     with col1:
         if st.button("Compute", key=f"compute_{z_id}", use_container_width=True):
@@ -571,9 +701,19 @@ def _render_zone_editor(idx: int, zone: dict) -> None:
             st.session_state.zones = [z for z in st.session_state.zones if z["id"] != z_id]
             st.rerun()
 
-    if zone["geojson"] is not None:
+    # ── Status ────────────────────────────────────────────────────────────
+    inner_ok = zone.get("geojson") is not None
+    range_ok = not zone.get("has_range") or zone.get("range_geojson") is not None
+
+    if inner_ok and range_ok:
         st.success("Ready ✓", icon="✅")
-    elif zone["error"]:
+    elif inner_ok and zone.get("has_range"):
+        # Inner done but outer failed or not yet computed
+        if zone.get("range_error"):
+            st.warning(f"Inner ✓ · Outer failed: {zone['range_error']}")
+        else:
+            st.info("Inner computed — press Compute to also fetch the outer boundary.")
+    elif zone.get("error"):
         st.error(zone["error"])
     else:
         st.caption("Not computed yet — press Compute.")
@@ -758,6 +898,10 @@ def _render_sidebar() -> None:
             "lat": None, "lon": None,
             "search_text": "",
             "geojson": None, "error": None,
+            "has_range": False,
+            "range_minutes": 45,
+            "range_km": 8.0,
+            "range_geojson": None, "range_error": None,
         })
         st.rerun()
 
