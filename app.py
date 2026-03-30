@@ -1,13 +1,17 @@
 """
 Commute Time Map — Streamlit web app
 Visualise travel-time isochrones (car, bicycle, walking, public transit) and
-as-the-crow-flies distance circles from a chosen origin.  Each zone has its
-own origin.  Zones can be combined with arbitrary set expressions such as
-  (A union B) cut C
-using union / intersect / cut operators.
+as-the-crow-flies distance circles.  Each zone has its own origin.
+
+Zones are combined visually using a step-based pipeline builder:
+  Step 1: Zone A  union    Zone B  →  Step 1 result
+  Step 2: Step 1  cut      Zone C  →  Step 2 result
+  ...
+Any step's result can be used as the input to a later step, allowing
+arbitrary set-algebra without writing any expressions.
 
 API: Geoapify (https://www.geoapify.com/)
-     Free tier: 3,000 requests / day, no credit card required.
+     Free tier: 3 000 requests / day, no credit card required.
      Sign up at https://myprojects.geoapify.com/ to get an API key.
 """
 
@@ -41,24 +45,28 @@ TRANSPORT_MODES: dict[str, str] = {
     "Public Transit": "transit",
 }
 
-# Visually distinct palette
 DEFAULT_COLORS = [
-    "#e41a1c",  # red
-    "#377eb8",  # blue
-    "#4daf4a",  # green
-    "#984ea3",  # purple
-    "#ff7f00",  # orange
-    "#a65628",  # brown
-    "#f781bf",  # pink
-    "#999999",  # grey
+    "#e41a1c", "#377eb8", "#4daf4a", "#984ea3",
+    "#ff7f00", "#a65628", "#f781bf", "#999999",
 ]
 
-# Zones are labelled A, B, C, … in the UI and in expressions
 ZONE_LABELS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+OP_LABELS: dict[str, str] = {
+    "union":     "∪ union",
+    "intersect": "∩ intersect",
+    "cut":       "∖ cut (A − B)",
+}
 
 DEFAULT_LAT: float = 51.505
 DEFAULT_LON: float = -0.09
 MAP_ZOOM: int = 12
+
+# Colours for the step-result overlay
+RESULT_COLORS = [
+    "#1a1a2e", "#16213e", "#0f3460", "#533483",
+    "#e94560", "#2b2d42", "#8d99ae", "#ef233c",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -67,19 +75,20 @@ MAP_ZOOM: int = 12
 
 def _init_session_state() -> None:
     defaults: dict = {
-        "zones": [],           # list of zone dicts (see schema below)
-        "display_mode": "Show All",  # "Show All" | "Expression"
-        "expr_text": "",       # raw expression string
-        "expr_geom": None,     # evaluated Shapely geometry (or None)
-        "expr_color": "#e41a1c",
-        "expr_error": None,    # error message from last evaluation
+        "zones": [],             # list of zone dicts
+        "display_mode": "Show All",  # "Show All" | "Build Operation"
+        # ── operation pipeline ──
+        "op_steps": [],          # list of step dicts (see schema below)
+        "op_next_id": 1,         # monotonic counter for stable step IDs
+        "op_display_step": None, # step id to show on map, or None → last
+        "op_color": "#1a1a2e",   # overlay colour for the chosen result
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
 
 
-# Zone dict schema:
+# ── Zone dict schema ─────────────────────────────────────────────────────────
 # {
 #   "id":          str          — uuid4
 #   "zone_type":   str          — "Isochrone" | "Distance Circle"
@@ -87,11 +96,19 @@ def _init_session_state() -> None:
 #   "minutes":     int          — travel time (isochrone only)
 #   "radius_km":   float        — radius (distance circle only)
 #   "color":       str          — hex colour
-#   "lat":         float | None — origin latitude
-#   "lon":         float | None — origin longitude
-#   "search_text": str          — last searched string
-#   "geojson":     dict | None  — GeoJSON Feature
-#   "error":       str | None   — last error message
+#   "lat":         float | None
+#   "lon":         float | None
+#   "search_text": str
+#   "geojson":     dict | None
+#   "error":       str | None
+# }
+#
+# ── Step dict schema ─────────────────────────────────────────────────────────
+# {
+#   "id":    str  — stable "step_N" string, N from op_next_id counter
+#   "left":  str | None  — zone label ("A") or step id ("step_2") or None
+#   "op":    str  — "union" | "intersect" | "cut"
+#   "right": str | None  — same as left
 # }
 
 
@@ -100,7 +117,6 @@ def _init_session_state() -> None:
 # ---------------------------------------------------------------------------
 
 def geocode_location(text: str) -> tuple[float, float] | None:
-    """Return (lat, lon) for the first geocoding result, or None."""
     if not GEOAPIFY_KEY:
         st.error("GEOAPIFY_API_KEY is not set — geocoding unavailable.")
         return None
@@ -124,20 +140,14 @@ def geocode_location(text: str) -> tuple[float, float] | None:
 def fetch_isochrone(
     lat: float, lon: float, api_mode: str, minutes: int
 ) -> dict | None:
-    """
-    Call the Geoapify Isoline API and return the first GeoJSON Feature, or raise
-    RuntimeError on HTTP/network failure.
-    """
     if not GEOAPIFY_KEY:
         return None
     try:
         resp = requests.get(
             ISOLINE_URL,
             params={
-                "lat": lat,
-                "lon": lon,
-                "type": "time",
-                "mode": api_mode,
+                "lat": lat, "lon": lon,
+                "type": "time", "mode": api_mode,
                 "range": minutes * 60,
                 "apiKey": GEOAPIFY_KEY,
             },
@@ -157,10 +167,6 @@ def fetch_isochrone(
 def make_distance_circle(
     lat: float, lon: float, radius_km: float, resolution: int = 64
 ) -> dict:
-    """
-    Return a GeoJSON Feature (Polygon) representing a geodesic circle.
-    Uses local UTM projection for accuracy.
-    """
     utm_zone = int((lon + 180) / 6) + 1
     utm_crs = pyproj.CRS.from_dict(
         {"proj": "utm", "zone": utm_zone, "south": lat < 0, "ellps": "WGS84"}
@@ -168,11 +174,9 @@ def make_distance_circle(
     wgs84 = pyproj.CRS.from_epsg(4326)
     to_utm = pyproj.Transformer.from_crs(wgs84, utm_crs, always_xy=True)
     from_utm = pyproj.Transformer.from_crs(utm_crs, wgs84, always_xy=True)
-
     x, y = to_utm.transform(lon, lat)
-    circle_utm = Point(x, y).buffer(radius_km * 1000, resolution=resolution)
-    coords = [list(from_utm.transform(px, py)) for px, py in circle_utm.exterior.coords]
-
+    circle = Point(x, y).buffer(radius_km * 1000, resolution=resolution)
+    coords = [list(from_utm.transform(px, py)) for px, py in circle.exterior.coords]
     return {
         "type": "Feature",
         "geometry": {"type": "Polygon", "coordinates": [coords]},
@@ -181,162 +185,122 @@ def make_distance_circle(
 
 
 def _to_shapely(feature: dict):
-    """Convert a GeoJSON Feature or bare Geometry to a Shapely geometry."""
     geom = feature if feature.get("type") != "Feature" else feature["geometry"]
     return shape(geom)
 
 
 def _to_geojson_feature(geom) -> dict:
-    """Convert a Shapely geometry to a minimal GeoJSON Feature dict."""
     return {"type": "Feature", "geometry": mapping(geom), "properties": {}}
 
 
 # ---------------------------------------------------------------------------
-# Expression parser
-#
-# Grammar (all binary operators are left-associative, equal precedence;
-# use parentheses to control evaluation order):
-#
-#   expr    := primary (OP primary)*
-#   primary := ZONE | '(' expr ')'
-#   OP      := 'union' | '|' | 'intersect' | '&' | 'cut' | '-' | 'diff'
-#   ZONE    := single letter A–Z (case-insensitive)
+# Operation pipeline: evaluation
 # ---------------------------------------------------------------------------
 
-def _tokenize(expr: str) -> list[tuple]:
-    """Convert an expression string to a flat list of typed tokens."""
-    tokens: list[tuple] = []
-    i = 0
-    keywords = {
-        "union": "UNION",
-        "intersect": "INTERSECT",
-        "intersection": "INTERSECT",
-        "cut": "DIFF",
-        "diff": "DIFF",
-        "difference": "DIFF",
-        "minus": "DIFF",
-    }
-    while i < len(expr):
-        ch = expr[i]
-        if ch.isspace():
-            i += 1
+def evaluate_operations(
+    zones: list[dict], steps: list[dict]
+) -> dict[str, tuple]:
+    """
+    Evaluate all steps in order.
+    Returns {step_id: (shapely_geom | None, error_str | None)}.
+    """
+    zone_geoms: dict[str, object] = {}
+    for i, z in enumerate(zones):
+        if z.get("geojson") and i < len(ZONE_LABELS):
+            try:
+                zone_geoms[ZONE_LABELS[i]] = _to_shapely(z["geojson"])
+            except Exception:  # noqa: BLE001
+                pass
+
+    results: dict[str, tuple] = {}
+
+    for step in steps:
+        sid = step["id"]
+        left_ref = step.get("left")
+        right_ref = step.get("right")
+
+        if left_ref is None or right_ref is None:
+            results[sid] = (None, "Both inputs must be selected.")
             continue
-        if ch == "(":
-            tokens.append(("LPAREN",))
-            i += 1
+
+        left_geom = _resolve_ref(left_ref, zone_geoms, results)
+        right_geom = _resolve_ref(right_ref, zone_geoms, results)
+
+        if left_geom is None:
+            results[sid] = (None, f"Left input ({_ref_label(left_ref)}) has no result.")
             continue
-        if ch == ")":
-            tokens.append(("RPAREN",))
-            i += 1
+        if right_geom is None:
+            results[sid] = (None, f"Right input ({_ref_label(right_ref)}) has no result.")
             continue
-        if ch == "|":
-            tokens.append(("UNION",))
-            i += 1
-            continue
-        if ch == "&":
-            tokens.append(("INTERSECT",))
-            i += 1
-            continue
-        if ch == "-":
-            tokens.append(("DIFF",))
-            i += 1
-            continue
-        if ch.isalpha():
-            # Greedily read the full word, then classify
-            j = i
-            while j < len(expr) and expr[j].isalpha():
-                j += 1
-            word = expr[i:j].lower()
-            if word in keywords:
-                tokens.append((keywords[word],))
-            elif len(word) == 1:
-                tokens.append(("ZONE", word.upper()))
+
+        try:
+            op = step.get("op", "union")
+            if op == "union":
+                result = left_geom.union(right_geom)
+            elif op == "intersect":
+                result = left_geom.intersection(right_geom)
+            elif op == "cut":
+                result = left_geom.difference(right_geom)
             else:
-                # Multi-letter word that isn't a keyword is an unknown zone name
-                raise ValueError(
-                    f"Unknown keyword or zone name: {expr[i:j]!r}. "
-                    "Zone names must be single letters (A, B, C, …). "
-                    f"Operators: union, intersect, cut."
-                )
-            i = j
-            continue
-        raise ValueError(f"Unexpected character: {ch!r} at position {i}")
-    return tokens
+                results[sid] = (None, f"Unknown operation: {op!r}")
+                continue
+
+            if result.is_empty:
+                results[sid] = (None, "Result is empty.")
+            else:
+                results[sid] = (result, None)
+        except Exception as exc:  # noqa: BLE001
+            results[sid] = (None, f"Geometry error: {exc}")
+
+    return results
 
 
-class _Parser:
-    """Recursive-descent parser that evaluates a zone expression directly."""
-
-    def __init__(self, tokens: list[tuple], zone_geoms: dict):
-        self.tokens = tokens
-        self.pos = 0
-        self.zone_geoms = zone_geoms
-
-    def _peek(self) -> str | None:
-        return self.tokens[self.pos][0] if self.pos < len(self.tokens) else None
-
-    def _consume(self) -> tuple:
-        tok = self.tokens[self.pos]
-        self.pos += 1
-        return tok
-
-    def parse_expr(self):
-        """Parse: primary (OP primary)*  — left-associative."""
-        left = self._parse_primary()
-        while self._peek() in ("UNION", "INTERSECT", "DIFF"):
-            op = self._consume()[0]
-            right = self._parse_primary()
-            if op == "UNION":
-                left = left.union(right)
-            elif op == "INTERSECT":
-                left = left.intersection(right)
-            elif op == "DIFF":
-                left = left.difference(right)
-        return left
-
-    def _parse_primary(self):
-        tok_type = self._peek()
-        if tok_type is None:
-            raise ValueError("Unexpected end of expression — expected a zone name or '('.")
-        if tok_type == "LPAREN":
-            self._consume()
-            result = self.parse_expr()
-            if self._peek() != "RPAREN":
-                raise ValueError("Missing closing ')'.")
-            self._consume()
-            return result
-        if tok_type == "ZONE":
-            label = self._consume()[1]
-            if label not in self.zone_geoms:
-                available = ", ".join(sorted(self.zone_geoms)) or "none"
-                raise ValueError(
-                    f"Zone '{label}' has no computed geometry. "
-                    f"Computed zones: {available}."
-                )
-            return self.zone_geoms[label]
-        raise ValueError(
-            f"Expected a zone name or '(' but got token type: {tok_type!r}."
-        )
+def _resolve_ref(ref: str, zone_geoms: dict, step_results: dict):
+    """Resolve a left/right reference to a Shapely geometry, or None."""
+    if ref in zone_geoms:
+        return zone_geoms[ref]
+    if ref in step_results:
+        return step_results[ref][0]  # None if that step errored
+    return None
 
 
-def evaluate_expression(expr_str: str, zone_geoms: dict):
-    """
-    Parse and evaluate a boolean zone expression.
-    zone_geoms: {label: shapely_geometry}
-    Returns a Shapely geometry, or raises ValueError.
-    """
-    tokens = _tokenize(expr_str.strip())
-    if not tokens:
-        raise ValueError("Expression is empty.")
-    parser = _Parser(tokens, zone_geoms)
-    result = parser.parse_expr()
-    if parser.pos < len(tokens):
-        leftover = tokens[parser.pos:]
-        raise ValueError(
-            f"Unexpected extra tokens after expression: "
-            f"{' '.join(t[0] for t in leftover)}"
-        )
-    return result
+def _ref_label(ref: str | None) -> str:
+    """Human-readable label for a ref string."""
+    if ref is None:
+        return "(none)"
+    if len(ref) == 1:
+        return f"Zone {ref}"
+    # "step_N"
+    return f"Step {ref.split('_')[1]}"
+
+
+# ---------------------------------------------------------------------------
+# Operation pipeline: step management helpers
+# ---------------------------------------------------------------------------
+
+def _add_step() -> None:
+    sid = f"step_{st.session_state.op_next_id}"
+    st.session_state.op_next_id += 1
+    st.session_state.op_steps.append(
+        {"id": sid, "left": None, "op": "union", "right": None}
+    )
+
+
+def _remove_step(del_idx: int) -> None:
+    steps = st.session_state.op_steps
+    deleted_id = steps[del_idx]["id"]
+    steps.pop(del_idx)
+
+    # Nullify dangling references in later steps
+    for s in steps:
+        if s["left"] == deleted_id:
+            s["left"] = None
+        if s["right"] == deleted_id:
+            s["right"] = None
+
+    # Fix display selection
+    if st.session_state.op_display_step == deleted_id:
+        st.session_state.op_display_step = steps[-1]["id"] if steps else None
 
 
 # ---------------------------------------------------------------------------
@@ -344,13 +308,11 @@ def evaluate_expression(expr_str: str, zone_geoms: dict):
 # ---------------------------------------------------------------------------
 
 def _compute_zone(zone: dict) -> None:
-    """Fetch / compute the zone geometry; mutates zone in place."""
     lat = zone.get("lat")
     lon = zone.get("lon")
     if lat is None or lon is None:
         zone["error"] = "No location set — search for an address first."
         return
-
     zone["geojson"] = None
     zone["error"] = None
 
@@ -358,11 +320,10 @@ def _compute_zone(zone: dict) -> None:
         if not GEOAPIFY_KEY:
             zone["error"] = "GEOAPIFY_API_KEY not set."
             return
-        api_mode = TRANSPORT_MODES[zone["mode"]]
         try:
-            feature = fetch_isochrone(lat, lon, api_mode, zone["minutes"])
+            feature = fetch_isochrone(lat, lon, TRANSPORT_MODES[zone["mode"]], zone["minutes"])
             if feature is None:
-                zone["error"] = "API returned no isochrone for this location/mode."
+                zone["error"] = "API returned no isochrone."
             else:
                 zone["geojson"] = feature
         except RuntimeError as exc:
@@ -371,30 +332,26 @@ def _compute_zone(zone: dict) -> None:
         try:
             zone["geojson"] = make_distance_circle(lat, lon, zone["radius_km"])
         except Exception as exc:  # noqa: BLE001
-            zone["error"] = f"Circle computation failed: {exc}"
+            zone["error"] = f"Circle error: {exc}"
 
 
 # ---------------------------------------------------------------------------
-# Map bounds helpers
+# Map bounds
 # ---------------------------------------------------------------------------
 
 def _bounds_from_zones(zones: list[dict]) -> list | None:
-    """Return [[min_lat, min_lon], [max_lat, max_lon]] covering all zones, or None."""
     pts: list[tuple[float, float]] = []
     for z in zones:
         if z.get("lat") and z.get("lon"):
             pts.append((z["lat"], z["lon"]))
         if z.get("geojson"):
             try:
-                b = _to_shapely(z["geojson"]).bounds  # (minx, miny, maxx, maxy)
-                pts.append((b[1], b[0]))
-                pts.append((b[3], b[2]))
+                b = _to_shapely(z["geojson"]).bounds
+                pts += [(b[1], b[0]), (b[3], b[2])]
             except Exception:  # noqa: BLE001
                 pass
-
     if not pts:
         return None
-
     min_lat = min(p[0] for p in pts)
     max_lat = max(p[0] for p in pts)
     min_lon = min(p[1] for p in pts)
@@ -412,11 +369,6 @@ def _bounds_from_zones(zones: list[dict]) -> list | None:
 # ---------------------------------------------------------------------------
 
 def build_map(render_items: list[dict], bounds: list | None) -> folium.Map:
-    """
-    render_items: list of dicts with keys:
-        color, feature (GeoJSON Feature or bare Geometry), fill_opacity,
-        weight, opacity, label (optional), origin (optional lat/lon tuple)
-    """
     center = (
         [(bounds[0][0] + bounds[1][0]) / 2, (bounds[0][1] + bounds[1][1]) / 2]
         if bounds
@@ -432,7 +384,6 @@ def build_map(render_items: list[dict], bounds: list | None) -> folium.Map:
         opacity = item.get("opacity", 0.8)
         label = item.get("label", "")
 
-        # Normalise to GeoJSON Feature
         if feature.get("type") != "Feature":
             feature = {"type": "Feature", "geometry": feature, "properties": {}}
 
@@ -440,30 +391,22 @@ def build_map(render_items: list[dict], bounds: list | None) -> folium.Map:
             feature,
             tooltip=label,
             style_function=lambda _f, c=color, fo=fill_opacity, w=weight, o=opacity: {
-                "fillColor": c,
-                "color": c,
-                "weight": w,
-                "fillOpacity": fo,
-                "opacity": o,
+                "fillColor": c, "color": c,
+                "weight": w, "fillOpacity": fo, "opacity": o,
             },
         ).add_to(m)
 
-        # Small dot at the zone's origin
         if "origin" in item:
             lat, lon = item["origin"]
             folium.CircleMarker(
                 location=[lat, lon],
-                radius=5,
-                color=color,
-                fill=True,
-                fill_color=color,
-                fill_opacity=0.9,
+                radius=5, color=color,
+                fill=True, fill_color=color, fill_opacity=0.9,
                 tooltip=f"{label} origin" if label else "Origin",
             ).add_to(m)
 
     if bounds:
         m.fit_bounds(bounds)
-
     return m
 
 
@@ -471,97 +414,68 @@ def build_map(render_items: list[dict], bounds: list | None) -> folium.Map:
 # Render items builder
 # ---------------------------------------------------------------------------
 
+def _zone_render_item(z: dict, idx: int, **overrides) -> dict:
+    label = f"Zone {ZONE_LABELS[idx]}" if idx < len(ZONE_LABELS) else f"Zone {idx}"
+    item: dict = {
+        "color": z["color"],
+        "feature": z["geojson"],
+        "fill_opacity": 0.25,
+        "weight": 2,
+        "opacity": 0.8,
+        "label": label,
+    }
+    if z.get("lat") and z.get("lon"):
+        item["origin"] = (z["lat"], z["lon"])
+    item.update(overrides)
+    return item
+
+
 def _get_render_items() -> list[dict]:
     zones = st.session_state.zones
 
-    def _zone_item(z: dict, idx: int, **overrides) -> dict:
-        label = f"Zone {ZONE_LABELS[idx]}" if idx < len(ZONE_LABELS) else f"Zone {idx}"
-        item: dict = {
-            "color": z["color"],
-            "feature": z["geojson"],
-            "fill_opacity": 0.25,
-            "weight": 2,
-            "opacity": 0.8,
-            "label": label,
-        }
-        if z.get("lat") and z.get("lon"):
-            item["origin"] = (z["lat"], z["lon"])
-        item.update(overrides)
-        return item
-
     if st.session_state.display_mode == "Show All":
         return [
-            _zone_item(z, i)
+            _zone_render_item(z, i)
             for i, z in enumerate(zones)
             if z.get("geojson")
         ]
 
-    # Expression mode
+    # ── Build Operation mode ──────────────────────────────────────────────
     ghost_items = [
-        _zone_item(z, i, fill_opacity=0.06, weight=1.0, opacity=0.35)
+        _zone_render_item(z, i, fill_opacity=0.06, weight=1.0, opacity=0.3)
         for i, z in enumerate(zones)
         if z.get("geojson")
     ]
 
-    if st.session_state.expr_geom is None:
-        return ghost_items  # no result yet: show ghosts only
+    steps = st.session_state.op_steps
+    if not steps:
+        return ghost_items
 
-    result_item: dict = {
-        "color": st.session_state.expr_color,
-        "feature": _to_geojson_feature(st.session_state.expr_geom),
-        "fill_opacity": 0.45,
-        "weight": 3,
-        "opacity": 1.0,
-        "label": "Expression result",
-    }
-    return ghost_items + [result_item]
+    step_results = evaluate_operations(zones, steps)
 
+    # Determine which step to display
+    display_sid = st.session_state.op_display_step
+    if display_sid is None or display_sid not in step_results:
+        # Default: last step
+        display_sid = steps[-1]["id"]
 
-# ---------------------------------------------------------------------------
-# Expression evaluation (sidebar action)
-# ---------------------------------------------------------------------------
+    geom, error = step_results.get(display_sid, (None, "Step not evaluated."))
+    if geom is None:
+        return ghost_items  # error shown in sidebar; map shows ghosts only
 
-def _evaluate_expression() -> None:
-    """Evaluate the current expression text; update session state in place."""
-    expr_text = st.session_state.expr_text.strip()
-    if not expr_text:
-        st.session_state.expr_error = "Enter an expression first."
-        st.session_state.expr_geom = None
-        return
+    step_pos = {s["id"]: i + 1 for i, s in enumerate(steps)}
+    pos = step_pos.get(display_sid, "?")
 
-    # Build zone geometry map from computed zones
-    zone_geoms: dict = {}
-    for i, z in enumerate(st.session_state.zones):
-        if z.get("geojson") is not None and i < len(ZONE_LABELS):
-            label = ZONE_LABELS[i]
-            try:
-                zone_geoms[label] = _to_shapely(z["geojson"])
-            except Exception as exc:  # noqa: BLE001
-                st.session_state.expr_error = (
-                    f"Zone {label} has invalid geometry: {exc}"
-                )
-                st.session_state.expr_geom = None
-                return
-
-    try:
-        result = evaluate_expression(expr_text, zone_geoms)
-    except ValueError as exc:
-        st.session_state.expr_error = str(exc)
-        st.session_state.expr_geom = None
-        return
-    except Exception as exc:  # noqa: BLE001
-        st.session_state.expr_error = f"Geometry operation failed: {exc}"
-        st.session_state.expr_geom = None
-        return
-
-    if result.is_empty:
-        st.session_state.expr_error = (
-            "Result is empty — zones may not overlap, or the cut removed everything."
-        )
-        st.session_state.expr_geom = None
-    else:
-        st.session_state.expr_geom = result
-        st.session_state.expr_error = None
+    return ghost_items + [
+        {
+            "color": st.session_state.op_color,
+            "feature": _to_geojson_feature(geom),
+            "fill_opacity": 0.45,
+            "weight": 3,
+            "opacity": 1.0,
+            "label": f"Step {pos} result",
+        }
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -569,15 +483,13 @@ def _evaluate_expression() -> None:
 # ---------------------------------------------------------------------------
 
 def _render_zone_editor(idx: int, zone: dict) -> None:
-    """Render all editing widgets for a single zone (inside an expander)."""
     z_id = zone["id"]
-    label = ZONE_LABELS[idx] if idx < len(ZONE_LABELS) else f"Z{idx}"
 
-    # ── Per-zone location search ──────────────────────────────────────────
+    # Per-zone location search
     col_input, col_btn = st.columns([3, 1])
     with col_input:
         search = st.text_input(
-            "Address / place",
+            "Address",
             value=zone.get("search_text", ""),
             placeholder="e.g. Canary Wharf, London",
             key=f"search_{z_id}",
@@ -593,8 +505,6 @@ def _render_zone_editor(idx: int, zone: dict) -> None:
                     zone["search_text"] = search.strip()
                     zone["geojson"] = None
                     zone["error"] = None
-                    # Expression result may be stale now
-                    st.session_state.expr_geom = None
                     st.rerun()
                 else:
                     st.warning("No results found.")
@@ -604,9 +514,8 @@ def _render_zone_editor(idx: int, zone: dict) -> None:
     if zone.get("lat") is not None:
         st.caption(f"📍 {zone['lat']:.4f}, {zone['lon']:.4f}")
     else:
-        st.caption("📍 No location set — search above.")
+        st.caption("📍 No location set.")
 
-    # ── Zone type & parameters ────────────────────────────────────────────
     new_type = st.selectbox(
         "Type",
         ["Isochrone", "Distance Circle"],
@@ -617,7 +526,6 @@ def _render_zone_editor(idx: int, zone: dict) -> None:
         zone["zone_type"] = new_type
         zone["geojson"] = None
         zone["error"] = None
-        st.session_state.expr_geom = None
 
     if zone["zone_type"] == "Isochrone":
         new_mode = st.selectbox(
@@ -630,54 +538,39 @@ def _render_zone_editor(idx: int, zone: dict) -> None:
             zone["mode"] = new_mode
             zone["geojson"] = None
             zone["error"] = None
-            st.session_state.expr_geom = None
 
         new_min = st.slider(
-            "Travel time (minutes)",
-            min_value=5,
-            max_value=120,
-            value=zone["minutes"],
-            step=5,
+            "Travel time (minutes)", 5, 120, zone["minutes"], step=5,
             key=f"min_{z_id}",
         )
         if new_min != zone["minutes"]:
             zone["minutes"] = new_min
             zone["geojson"] = None
             zone["error"] = None
-            st.session_state.expr_geom = None
     else:
         new_radius = st.number_input(
-            "Radius (km)",
-            min_value=0.1,
-            max_value=500.0,
-            value=zone["radius_km"],
-            step=0.5,
-            key=f"radius_{z_id}",
-            format="%.1f",
+            "Radius (km)", min_value=0.1, max_value=500.0,
+            value=zone["radius_km"], step=0.5,
+            key=f"radius_{z_id}", format="%.1f",
         )
         if float(new_radius) != zone["radius_km"]:
             zone["radius_km"] = float(new_radius)
             zone["geojson"] = None
             zone["error"] = None
-            st.session_state.expr_geom = None
 
     zone["color"] = st.color_picker("Colour", zone["color"], key=f"color_{z_id}")
 
-    # ── Compute / Remove ──────────────────────────────────────────────────
     col1, col2 = st.columns(2)
     with col1:
         if st.button("Compute", key=f"compute_{z_id}", use_container_width=True):
             with st.spinner("Computing…"):
                 _compute_zone(zone)
-            st.session_state.expr_geom = None  # invalidate expression result
             st.rerun()
     with col2:
         if st.button("Remove", key=f"remove_{z_id}", use_container_width=True):
             st.session_state.zones = [z for z in st.session_state.zones if z["id"] != z_id]
-            st.session_state.expr_geom = None
             st.rerun()
 
-    # Status
     if zone["geojson"] is not None:
         st.success("Ready ✓", icon="✅")
     elif zone["error"]:
@@ -687,70 +580,157 @@ def _render_zone_editor(idx: int, zone: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Sidebar: combine-zones panel
+# Sidebar: operation pipeline builder
 # ---------------------------------------------------------------------------
 
-def _render_combine_panel() -> None:
-    st.header("⚙️ Combine Zones")
+def _build_input_options(
+    step_idx: int,
+    zones: list[dict],
+    steps: list[dict],
+) -> tuple[list, dict]:
+    """
+    Return (option_values, label_map) for a left/right input selectbox
+    at position step_idx (0-based).
+    option_values[0] is always None → "(select input)".
+    """
+    vals: list = [None]
+    labels: dict = {None: "(select input)"}
 
-    ready_labels = [
-        ZONE_LABELS[i]
-        for i, z in enumerate(st.session_state.zones)
-        if z.get("geojson") is not None and i < len(ZONE_LABELS)
-    ]
+    for i, z in enumerate(zones):
+        if z.get("geojson") and i < len(ZONE_LABELS):
+            lbl = ZONE_LABELS[i]
+            vals.append(lbl)
+            labels[lbl] = f"Zone {lbl}"
 
-    if ready_labels:
-        st.caption(f"Computed zones: **{', '.join(ready_labels)}**")
-    else:
-        st.caption("No computed zones yet.")
+    for j in range(step_idx):  # only steps that come before this one
+        sid = steps[j]["id"]
+        pos = j + 1
+        vals.append(sid)
+        labels[sid] = f"Step {pos} result"
 
-    # Display mode toggle
-    mode = st.radio(
-        "Display mode",
-        ["Show All", "Expression"],
-        index=["Show All", "Expression"].index(st.session_state.display_mode),
-        key="radio_display_mode",
-        horizontal=True,
-    )
-    st.session_state.display_mode = mode
+    return vals, labels
 
-    if mode == "Expression":
-        st.markdown(
-            "**Operators:** `union` `intersect` `cut`  \n"
-            "**Symbols:** `|` &nbsp; `&` &nbsp; `-`  \n"
-            "**Examples:**  \n"
-            "`A union B`  \n"
-            "`A intersect B`  \n"
-            "`(A union B) cut C`  \n"
-            "`(A union B) intersect (C union D)`"
-        )
 
-        expr_text = st.text_input(
-            "Expression",
-            value=st.session_state.expr_text,
-            placeholder="e.g. (A union B) cut C",
-            key="expr_input",
-        )
-        st.session_state.expr_text = expr_text
+def _render_operation_builder() -> None:
+    zones = st.session_state.zones
+    steps = st.session_state.op_steps
 
-        col1, col2 = st.columns([1, 1])
-        with col1:
-            result_color = st.color_picker(
-                "Result colour",
-                st.session_state.expr_color,
-                key="expr_color_picker",
+    # Pre-evaluate for status badges
+    step_results = evaluate_operations(zones, steps) if steps else {}
+
+    if not steps:
+        st.caption("Press **+ Add Step** to start combining zones.")
+
+    for step_idx, step in enumerate(steps):
+        sid = step["id"]
+        pos = step_idx + 1
+
+        st.markdown(f"**Step {pos}**")
+
+        opt_vals, opt_labels = _build_input_options(step_idx, zones, steps)
+
+        # Clamp stored value to valid options (guards against dangling refs)
+        left_val = step["left"] if step["left"] in opt_vals else None
+        right_val = step["right"] if step["right"] in opt_vals else None
+
+        col_l, col_op, col_r, col_del = st.columns([2.8, 2.0, 2.8, 0.7])
+
+        with col_l:
+            new_left = st.selectbox(
+                "left",
+                options=opt_vals,
+                index=opt_vals.index(left_val),
+                format_func=lambda v, m=opt_labels: m.get(v, str(v)),
+                key=f"op_left_{sid}",
+                label_visibility="collapsed",
             )
-            st.session_state.expr_color = result_color
-        with col2:
-            st.write("")  # vertical spacer
-            if st.button("Evaluate", key="btn_evaluate", use_container_width=True):
-                _evaluate_expression()
+            step["left"] = new_left if new_left != "(select input)" else None
+
+        with col_op:
+            op_keys = list(OP_LABELS.keys())
+            cur_op = step.get("op", "union")
+            new_op = st.selectbox(
+                "op",
+                options=op_keys,
+                index=op_keys.index(cur_op) if cur_op in op_keys else 0,
+                format_func=lambda k: OP_LABELS[k],
+                key=f"op_op_{sid}",
+                label_visibility="collapsed",
+            )
+            step["op"] = new_op
+
+        with col_r:
+            new_right = st.selectbox(
+                "right",
+                options=opt_vals,
+                index=opt_vals.index(right_val),
+                format_func=lambda v, m=opt_labels: m.get(v, str(v)),
+                key=f"op_right_{sid}",
+                label_visibility="collapsed",
+            )
+            step["right"] = new_right if new_right != "(select input)" else None
+
+        with col_del:
+            if st.button("✕", key=f"op_del_{sid}", help="Remove this step"):
+                _remove_step(step_idx)
                 st.rerun()
 
-        if st.session_state.expr_error:
-            st.error(st.session_state.expr_error)
-        elif st.session_state.expr_geom is not None:
-            st.success("Expression evaluated ✓", icon="✅")
+        # Status badge
+        if sid in step_results:
+            geom, err = step_results[sid]
+            if geom is not None:
+                st.caption(f":green[✓ Step {pos} ready]")
+            else:
+                st.caption(f":red[✗ {err}]")
+        else:
+            st.caption(":gray[⏸ not evaluated]")
+
+        if step_idx < len(steps) - 1:
+            st.divider()
+
+    if st.button("＋ Add Step", key="btn_add_step", use_container_width=True):
+        _add_step()
+        st.rerun()
+
+    # ── Display result selector ───────────────────────────────────────────
+    if steps:
+        st.divider()
+
+        # Build list of all step IDs and their display names
+        step_ids = [s["id"] for s in steps]
+        step_pos_map = {s["id"]: i + 1 for i, s in enumerate(steps)}
+
+        # Default display to last step
+        current = st.session_state.op_display_step
+        if current not in step_ids:
+            current = step_ids[-1]
+            st.session_state.op_display_step = current
+
+        col_sel, col_col = st.columns([3, 1])
+        with col_sel:
+            chosen = st.selectbox(
+                "Show on map",
+                options=step_ids,
+                index=step_ids.index(current),
+                format_func=lambda sid, m=step_pos_map: f"Step {m[sid]} result",
+                key="sel_display_step",
+            )
+            st.session_state.op_display_step = chosen
+
+        with col_col:
+            result_color = st.color_picker(
+                "Colour",
+                st.session_state.op_color,
+                key="op_color_picker",
+            )
+            st.session_state.op_color = result_color
+
+        # Show map-result status
+        chosen_geom, chosen_err = step_results.get(chosen, (None, "not evaluated"))
+        if chosen_geom is not None:
+            st.success(f"Step {step_pos_map[chosen]} will be shown on the map.", icon="🗺️")
+        elif chosen_err:
+            st.error(f"Step {step_pos_map[chosen]} cannot be shown: {chosen_err}")
 
 
 # ---------------------------------------------------------------------------
@@ -768,25 +748,50 @@ def _render_sidebar() -> None:
 
     if st.button("＋ Add Zone", key="btn_add_zone", use_container_width=True):
         color_idx = len(st.session_state.zones) % len(DEFAULT_COLORS)
-        st.session_state.zones.append(
-            {
-                "id": str(uuid.uuid4()),
-                "zone_type": "Isochrone",
-                "mode": "Car",
-                "minutes": 30,
-                "radius_km": 5.0,
-                "color": DEFAULT_COLORS[color_idx],
-                "lat": None,
-                "lon": None,
-                "search_text": "",
-                "geojson": None,
-                "error": None,
-            }
-        )
+        st.session_state.zones.append({
+            "id": str(uuid.uuid4()),
+            "zone_type": "Isochrone",
+            "mode": "Car",
+            "minutes": 30,
+            "radius_km": 5.0,
+            "color": DEFAULT_COLORS[color_idx],
+            "lat": None, "lon": None,
+            "search_text": "",
+            "geojson": None, "error": None,
+        })
         st.rerun()
 
     st.divider()
-    _render_combine_panel()
+
+    # ── Combine zones ─────────────────────────────────────────────────────
+    st.header("⚙️ Combine Zones")
+
+    # Show which zones are available for operations
+    ready = [
+        ZONE_LABELS[i]
+        for i, z in enumerate(st.session_state.zones)
+        if z.get("geojson") and i < len(ZONE_LABELS)
+    ]
+    if ready:
+        st.caption(f"Computed zones: **{', '.join(ready)}**")
+    else:
+        st.caption("No computed zones yet.")
+
+    mode = st.radio(
+        "Display mode",
+        ["Show All", "Build Operation"],
+        index=["Show All", "Build Operation"].index(st.session_state.display_mode),
+        key="radio_display_mode",
+        horizontal=True,
+    )
+    st.session_state.display_mode = mode
+
+    if mode == "Build Operation":
+        st.markdown(
+            "Chain steps to combine zones. Each step's result can feed into the next.  \n"
+            "**Operations:** ∪ union · ∩ intersect · ∖ cut (A minus B)"
+        )
+        _render_operation_builder()
 
 
 # ---------------------------------------------------------------------------
@@ -818,8 +823,8 @@ def main() -> None:
     st.title("🗺️ Commute Time Map")
     st.caption(
         "Each zone has its own origin and transport mode. "
-        "Switch to **Expression** mode to combine zones with "
-        "`union`, `intersect`, and `cut` — e.g. `(A union B) cut C`."
+        "Switch to **Build Operation** to chain steps — e.g. "
+        "Step 1: A ∪ B, Step 2: Step 1 ∖ C."
     )
 
     render_items = _get_render_items()
