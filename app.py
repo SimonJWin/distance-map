@@ -80,8 +80,6 @@ def _init_session_state() -> None:
         # ── operation pipeline ──
         "op_steps": [],          # list of step dicts (see schema below)
         "op_next_id": 1,         # monotonic counter for stable step IDs
-        "op_display_step": None, # step id to show on map, or None → last
-        "op_color": "#1a1a2e",   # overlay colour for the chosen result
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -115,10 +113,12 @@ def _init_session_state() -> None:
 #
 # ── Step dict schema ─────────────────────────────────────────────────────────
 # {
-#   "id":    str  — stable "step_N" string, N from op_next_id counter
-#   "left":  str | None  — zone label ("A") or step id ("step_2") or None
-#   "op":    str  — "union" | "intersect" | "cut"
-#   "right": str | None  — same as left
+#   "id":      str  — stable "step_N" string, N from op_next_id counter
+#   "left":    str | None  — zone label ("A") or step id ("step_2") or None
+#   "op":      str  — "union" | "intersect" | "cut"
+#   "right":   str | None  — same as left
+#   "visible": bool — whether the result is drawn on the map
+#   "color":   str  — hex colour for this step's result overlay
 # }
 
 
@@ -309,9 +309,11 @@ def _ref_label(ref: str | None) -> str:
 
 def _add_step() -> None:
     sid = f"step_{st.session_state.op_next_id}"
+    color = RESULT_COLORS[len(st.session_state.op_steps) % len(RESULT_COLORS)]
     st.session_state.op_next_id += 1
     st.session_state.op_steps.append(
-        {"id": sid, "left": None, "op": "union", "right": None}
+        {"id": sid, "left": None, "op": "union", "right": None,
+         "visible": True, "color": color}
     )
 
 
@@ -478,7 +480,7 @@ def _zone_render_items(z: dict, idx: int, ghost: bool = False) -> list[dict]:
     Otherwise emits just the inner zone.
     ghost=True reduces opacity for background display in Build-Operation mode.
     """
-    if not z.get("geojson"):
+    if not z.get("geojson") or not z.get("visible", True):
         return []
 
     label = f"Zone {ZONE_LABELS[idx]}" if idx < len(ZONE_LABELS) else f"Zone {idx}"
@@ -546,49 +548,46 @@ def _get_render_items() -> list[dict]:
         return ghost_items
 
     step_results = evaluate_operations(zones, steps)
-
-    # Determine which step to display
-    display_sid = st.session_state.op_display_step
-    if display_sid is None or display_sid not in step_results:
-        # Default: last step
-        display_sid = steps[-1]["id"]
-
-    geom_pair, error = step_results.get(display_sid, (None, "Step not evaluated."))
-    if geom_pair is None:
-        return ghost_items  # error shown in sidebar; map shows ghosts only
-
     step_pos = {s["id"]: i + 1 for i, s in enumerate(steps)}
-    pos = step_pos.get(display_sid, "?")
-    color = st.session_state.op_color
-    inner_geom, outer_geom = geom_pair
-    result_items: list[dict] = []
 
-    # Outer (borderline) ring — rendered first so inner sits on top
-    try:
-        ring = outer_geom.difference(inner_geom) if not inner_geom.is_empty else outer_geom
-        if not ring.is_empty:
+    result_items: list[dict] = []
+    for step in steps:
+        sid = step["id"]
+        if not step.get("visible", True):
+            continue
+        geom_pair, _ = step_results.get(sid, (None, None))
+        if geom_pair is None:
+            continue
+        color = step.get("color", RESULT_COLORS[0])
+        pos   = step_pos[sid]
+        inner_geom, outer_geom = geom_pair
+
+        # Outer (borderline) ring — rendered first so inner sits on top
+        try:
+            ring = outer_geom.difference(inner_geom) if not inner_geom.is_empty else outer_geom
+            if not ring.is_empty:
+                result_items.append({
+                    "color": color,
+                    "feature": _to_geojson_feature(ring),
+                    "fill_opacity": 0.12,
+                    "weight": 2.5,
+                    "opacity": 0.70,
+                    "dash_array": "7 5",
+                    "label": f"Step {pos} result (borderline)",
+                })
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Inner (ideal) zone
+        if not inner_geom.is_empty:
             result_items.append({
                 "color": color,
-                "feature": _to_geojson_feature(ring),
-                "fill_opacity": 0.12,
-                "weight": 2.5,
-                "opacity": 0.70,
-                "dash_array": "7 5",
-                "label": f"Step {pos} result (borderline)",
+                "feature": _to_geojson_feature(inner_geom),
+                "fill_opacity": 0.45,
+                "weight": 3,
+                "opacity": 1.0,
+                "label": f"Step {pos} result",
             })
-    except Exception:  # noqa: BLE001
-        pass
-
-    # Inner (ideal) zone
-    if not inner_geom.is_empty:
-        result_items.append({
-            "color": color,
-            "feature": _to_geojson_feature(inner_geom),
-            "fill_opacity": 0.45,
-            "weight": 3,
-            "opacity": 1.0,
-            "label": f"Step {pos} result",
-        })
 
     return ghost_items + result_items
 
@@ -599,6 +598,12 @@ def _get_render_items() -> list[dict]:
 
 def _render_zone_editor(idx: int, zone: dict) -> None:
     z_id = zone["id"]
+
+    zone["visible"] = st.toggle(
+        "Visible on map",
+        value=zone.get("visible", True),
+        key=f"vis_{z_id}",
+    )
 
     # Per-zone location search
     search = st.text_input(
@@ -793,7 +798,19 @@ def _render_operation_builder() -> None:
         sid = step["id"]
         pos = step_idx + 1
 
-        st.markdown(f"**Step {pos}**")
+        hdr_l, hdr_c, hdr_vis = st.columns([3, 1, 1])
+        with hdr_l:
+            st.markdown(f"**Step {pos}**")
+        with hdr_c:
+            step["color"] = st.color_picker(
+                "colour", step.get("color", RESULT_COLORS[step_idx % len(RESULT_COLORS)]),
+                key=f"step_color_{sid}", label_visibility="collapsed",
+            )
+        with hdr_vis:
+            step["visible"] = st.toggle(
+                "show", value=step.get("visible", True),
+                key=f"step_vis_{sid}", help="Show result on map",
+            )
 
         opt_vals, opt_labels = _build_input_options(step_idx, zones, steps)
 
@@ -863,46 +880,6 @@ def _render_operation_builder() -> None:
         _add_step()
         st.rerun()
 
-    # ── Display result selector ───────────────────────────────────────────
-    if steps:
-        st.divider()
-
-        # Build list of all step IDs and their display names
-        step_ids = [s["id"] for s in steps]
-        step_pos_map = {s["id"]: i + 1 for i, s in enumerate(steps)}
-
-        # Default display to last step
-        current = st.session_state.op_display_step
-        if current not in step_ids:
-            current = step_ids[-1]
-            st.session_state.op_display_step = current
-
-        col_sel, col_col = st.columns([3, 1])
-        with col_sel:
-            chosen = st.selectbox(
-                "Show on map",
-                options=step_ids,
-                index=step_ids.index(current),
-                format_func=lambda sid, m=step_pos_map: f"Step {m[sid]} result",
-                key="sel_display_step",
-            )
-            st.session_state.op_display_step = chosen
-
-        with col_col:
-            result_color = st.color_picker(
-                "Colour",
-                st.session_state.op_color,
-                key="op_color_picker",
-            )
-            st.session_state.op_color = result_color
-
-        # Show map-result status
-        chosen_pair, chosen_err = step_results.get(chosen, (None, "not evaluated"))
-        if chosen_pair is not None:
-            st.success(f"Step {step_pos_map[chosen]} will be shown on the map.", icon="🗺️")
-        elif chosen_err:
-            st.error(f"Step {step_pos_map[chosen]} cannot be shown: {chosen_err}")
-
 
 # ---------------------------------------------------------------------------
 # Sidebar: full render
@@ -913,8 +890,9 @@ def _render_sidebar() -> None:
 
     for idx, zone in enumerate(st.session_state.zones):
         label = ZONE_LABELS[idx] if idx < len(ZONE_LABELS) else f"Z{idx}"
-        dot = "🟢" if zone["geojson"] else ("🔴" if zone["error"] else "⚪")
-        with st.expander(f"{dot} Zone {label}", expanded=True):
+        dot = "🟢" if zone.get("geojson") else ("🔴" if zone.get("error") else "⚪")
+        hidden_tag = " · hidden" if not zone.get("visible", True) else ""
+        with st.expander(f"{dot} Zone {label}{hidden_tag}", expanded=True):
             _render_zone_editor(idx, zone)
 
     if st.button("＋ Add Zone", key="btn_add_zone", use_container_width=True):
@@ -933,6 +911,7 @@ def _render_sidebar() -> None:
             "range_minutes": 45,
             "range_km": 8.0,
             "range_geojson": None, "range_error": None,
+            "visible": True,
         })
         st.rerun()
 
