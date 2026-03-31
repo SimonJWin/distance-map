@@ -570,30 +570,27 @@ def _render_zone_editor(idx: int, zone: dict) -> None:
     z_id = zone["id"]
 
     # Per-zone location search
-    col_input, col_btn = st.columns([3, 1])
-    with col_input:
-        search = st.text_input(
-            "Address",
-            value=zone.get("search_text", ""),
-            placeholder="e.g. Canary Wharf, London",
-            key=f"search_{z_id}",
-            label_visibility="collapsed",
-        )
-    with col_btn:
-        if st.button("Search", key=f"btn_search_{z_id}", use_container_width=True):
-            if search.strip():
-                with st.spinner("Geocoding…"):
-                    result = geocode_location(search.strip())
-                if result:
-                    zone["lat"], zone["lon"] = result
-                    zone["search_text"] = search.strip()
-                    zone["geojson"] = None
-                    zone["error"] = None
-                    st.rerun()
-                else:
-                    st.warning("No results found.")
+    search = st.text_input(
+        "Address",
+        value=zone.get("search_text", ""),
+        placeholder="e.g. Canary Wharf, London",
+        key=f"search_{z_id}",
+        label_visibility="collapsed",
+    )
+    if st.button("Search", key=f"btn_search_{z_id}", use_container_width=True):
+        if search.strip():
+            with st.spinner("Geocoding…"):
+                result = geocode_location(search.strip())
+            if result:
+                zone["lat"], zone["lon"] = result
+                zone["search_text"] = search.strip()
+                zone["geojson"] = None
+                zone["error"] = None
+                st.rerun()
             else:
-                st.warning("Enter an address first.")
+                st.warning("No results found.")
+        else:
+            st.warning("Enter an address first.")
 
     if zone.get("lat") is not None:
         st.caption(f"📍 {zone['lat']:.4f}, {zone['lon']:.4f}")
