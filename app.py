@@ -207,67 +207,77 @@ def _to_geojson_feature(geom) -> dict:
 # Operation pipeline: evaluation
 # ---------------------------------------------------------------------------
 
+# Each "geometry value" in the pipeline is a (inner, outer) pair.
+# Zones without a range use  outer = inner  so the ring is always empty.
+# Operations are applied independently to inner and outer; the borderline
+# ring is always  outer_result − inner_result  at render time.
+
+def _apply_op_pair(op: str, left: tuple, right: tuple) -> tuple:
+    """Apply a set operation to two (inner, outer) geometry pairs."""
+    iA, oA = left
+    iB, oB = right
+    if op == "union":
+        return (iA.union(iB), oA.union(oB))
+    if op == "intersect":
+        return (iA.intersection(iB), oA.intersection(oB))
+    if op == "cut":
+        return (iA.difference(iB), oA.difference(oB))
+    raise ValueError(f"Unknown operation: {op!r}")
+
+
 def evaluate_operations(
     zones: list[dict], steps: list[dict]
 ) -> dict[str, tuple]:
     """
     Evaluate all steps in order.
-    Returns {step_id: (shapely_geom | None, error_str | None)}.
+    Returns {step_id: ((inner_geom, outer_geom) | None, error_str | None)}.
+    Each geometry value is a (inner, outer) pair; outer == inner when no range.
     """
-    zone_geoms: dict[str, object] = {}
+    # Build (inner, outer) pairs for each computed zone
+    zone_geom_pairs: dict[str, tuple] = {}
     for i, z in enumerate(zones):
-        if i >= len(ZONE_LABELS):
+        if i >= len(ZONE_LABELS) or not z.get("geojson"):
             continue
-        # Prefer the outer boundary for operations when a range is defined,
-        # since that represents the full "acceptable" extent of the zone.
-        geojson_for_ops = (
-            z.get("range_geojson")
-            if z.get("has_range") and z.get("range_geojson")
-            else z.get("geojson")
-        )
-        if geojson_for_ops:
-            try:
-                zone_geoms[ZONE_LABELS[i]] = _to_shapely(geojson_for_ops)
-            except Exception:  # noqa: BLE001
-                pass
+        try:
+            inner = _to_shapely(z["geojson"])
+            outer = (
+                _to_shapely(z["range_geojson"])
+                if z.get("has_range") and z.get("range_geojson")
+                else inner
+            )
+            zone_geom_pairs[ZONE_LABELS[i]] = (inner, outer)
+        except Exception:  # noqa: BLE001
+            pass
 
     results: dict[str, tuple] = {}
 
     for step in steps:
         sid = step["id"]
-        left_ref = step.get("left")
+        left_ref  = step.get("left")
         right_ref = step.get("right")
 
         if left_ref is None or right_ref is None:
             results[sid] = (None, "Both inputs must be selected.")
             continue
 
-        left_geom = _resolve_ref(left_ref, zone_geoms, results)
-        right_geom = _resolve_ref(right_ref, zone_geoms, results)
+        left_pair  = _resolve_ref(left_ref,  zone_geom_pairs, results)
+        right_pair = _resolve_ref(right_ref, zone_geom_pairs, results)
 
-        if left_geom is None:
+        if left_pair is None:
             results[sid] = (None, f"Left input ({_ref_label(left_ref)}) has no result.")
             continue
-        if right_geom is None:
+        if right_pair is None:
             results[sid] = (None, f"Right input ({_ref_label(right_ref)}) has no result.")
             continue
 
         try:
             op = step.get("op", "union")
-            if op == "union":
-                result = left_geom.union(right_geom)
-            elif op == "intersect":
-                result = left_geom.intersection(right_geom)
-            elif op == "cut":
-                result = left_geom.difference(right_geom)
-            else:
-                results[sid] = (None, f"Unknown operation: {op!r}")
-                continue
+            inner, outer = _apply_op_pair(op, left_pair, right_pair)
 
-            if result.is_empty:
+            if inner.is_empty and outer.is_empty:
                 results[sid] = (None, "Result is empty.")
             else:
-                results[sid] = (result, None)
+                results[sid] = ((inner, outer), None)
         except Exception as exc:  # noqa: BLE001
             results[sid] = (None, f"Geometry error: {exc}")
 
@@ -543,23 +553,44 @@ def _get_render_items() -> list[dict]:
         # Default: last step
         display_sid = steps[-1]["id"]
 
-    geom, error = step_results.get(display_sid, (None, "Step not evaluated."))
-    if geom is None:
+    geom_pair, error = step_results.get(display_sid, (None, "Step not evaluated."))
+    if geom_pair is None:
         return ghost_items  # error shown in sidebar; map shows ghosts only
 
     step_pos = {s["id"]: i + 1 for i, s in enumerate(steps)}
     pos = step_pos.get(display_sid, "?")
+    color = st.session_state.op_color
+    inner_geom, outer_geom = geom_pair
+    result_items: list[dict] = []
 
-    return ghost_items + [
-        {
-            "color": st.session_state.op_color,
-            "feature": _to_geojson_feature(geom),
+    # Outer (borderline) ring — rendered first so inner sits on top
+    try:
+        ring = outer_geom.difference(inner_geom) if not inner_geom.is_empty else outer_geom
+        if not ring.is_empty:
+            result_items.append({
+                "color": color,
+                "feature": _to_geojson_feature(ring),
+                "fill_opacity": 0.12,
+                "weight": 2.5,
+                "opacity": 0.70,
+                "dash_array": "7 5",
+                "label": f"Step {pos} result (borderline)",
+            })
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Inner (ideal) zone
+    if not inner_geom.is_empty:
+        result_items.append({
+            "color": color,
+            "feature": _to_geojson_feature(inner_geom),
             "fill_opacity": 0.45,
             "weight": 3,
             "opacity": 1.0,
             "label": f"Step {pos} result",
-        }
-    ]
+        })
+
+    return ghost_items + result_items
 
 
 # ---------------------------------------------------------------------------
@@ -814,9 +845,12 @@ def _render_operation_builder() -> None:
 
         # Status badge
         if sid in step_results:
-            geom, err = step_results[sid]
-            if geom is not None:
-                st.caption(f":green[✓ Step {pos} ready]")
+            geom_pair, err = step_results[sid]
+            if geom_pair is not None:
+                inner, outer = geom_pair
+                has_ring = not outer.difference(inner).is_empty if not inner.is_empty else not outer.is_empty
+                suffix = " + borderline ring" if has_ring else ""
+                st.caption(f":green[✓ Step {pos} ready{suffix}]")
             else:
                 st.caption(f":red[✗ {err}]")
         else:
@@ -863,8 +897,8 @@ def _render_operation_builder() -> None:
             st.session_state.op_color = result_color
 
         # Show map-result status
-        chosen_geom, chosen_err = step_results.get(chosen, (None, "not evaluated"))
-        if chosen_geom is not None:
+        chosen_pair, chosen_err = step_results.get(chosen, (None, "not evaluated"))
+        if chosen_pair is not None:
             st.success(f"Step {step_pos_map[chosen]} will be shown on the map.", icon="🗺️")
         elif chosen_err:
             st.error(f"Step {step_pos_map[chosen]} cannot be shown: {chosen_err}")
